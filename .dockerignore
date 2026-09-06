@@ -1,0 +1,89 @@
+# Virtual Environments
+.venv/
+.venv312/
+venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Test and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+test-results.xml
+test-report.html
+.tox/
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+docs/
+
+# Test artifacts and downloads
+test_downloads/
+outputs/
+*.xlsx
+*.docx
+qa_requirements*.txt
+qa_requirements*.zip
+qa_requirements*.docx
+bad_requirements.zip
+
+# Environment variables (not needed in container)
+.env
+.env.local
+.env.*.local
+
+# Docker
+Dockerfile
+Dockerfile.tests
+docker-compose.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.circleci/
+
+# Project specific
+memory/
+.claude/
+ngrok_output.txt
+
+# Node (if any)
+node_modules/
+package-lock.json
+npm-debug.log

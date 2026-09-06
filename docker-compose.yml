@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  qa-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qa-agent
+    ports:
+      - "8501:8501"
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_LOGGER_LEVEL=info
+      # Add your OpenAI API key here or via .env file
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      # Mount for persistent output files
+      - ./outputs:/app/outputs
+      # Mount for test downloads
+      - ./test_downloads:/app/test_downloads
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - qa-network
+    labels:
+      - "com.qa-agent.description=QA Test Case Generator - Streamlit Application"
+      - "com.qa-agent.version=1.0"
+
+  # Optional: Test runner service for E2E tests
+  qa-agent-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.tests
+    container_name: qa-agent-tests
+    depends_on:
+      - qa-agent
+    environment:
+      - APP_URL=http://qa-agent:8501
+      - PYTEST_ARGS=-v --tb=short
+    volumes:
+      - ./test_e2e_playwright.py:/app/test_e2e_playwright.py
+      - ./tests:/app/tests
+      - ./test_downloads:/app/test_downloads
+    networks:
+      - qa-network
+    profiles:
+      - test
+    command: pytest test_e2e_playwright.py -v
+
+networks:
+  qa-network:
+    driver: bridge
+
+volumes:
+  outputs:
+  test_downloads:
