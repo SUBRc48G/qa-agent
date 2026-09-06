@@ -1,0 +1,9 @@
+python-dotenv
+openpyxl
+pypdf
+python-docx
+crewai
+openai
+sentence-transformers
+chromadb
+streamlit
