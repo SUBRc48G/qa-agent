@@ -1,5 +1,6 @@
 import os
 import re
+import ast
 import json
 from collections import Counter
 from dotenv import load_dotenv
@@ -327,6 +328,14 @@ automation_analyst = Agent(
 )
 
 estimator = Agent(role="Estimator", goal="Estimate effort", backstory="QA lead", llm=llm, verbose=True)
+
+automation_engineer = Agent(
+    role="Automation Engineer",
+    goal="Write clean, runnable Playwright pytest scripts that implement the given manual test cases",
+    backstory="SDET who writes production-grade Playwright test automation in Python",
+    llm=llm,
+    verbose=True
+)
 
 strategy_writer = Agent(
     role="QA Lead",
@@ -900,6 +909,893 @@ def _add_table(doc, headers, rows, style="Light List Accent 1"):
 def _add_bullets(doc, items):
     for item in items:
         doc.add_paragraph(str(item), style="List Bullet")
+
+
+def generate_frontend_testcases(base_url, max_pages=10, output_dir=".", progress_callback=None):
+    """
+    Discover pages on a frontend application by traversing links from the base URL,
+    then generate comprehensive test cases for each discovered page.
+
+    Args:
+        base_url: The starting URL of the frontend application (e.g. "http://localhost:8501")
+        max_pages: Maximum number of pages to discover and analyze (default 10)
+        output_dir: Directory to save the results
+        progress_callback: Optional function to receive progress updates
+
+    Returns:
+        A dict containing:
+        - discovered_pages: List of discovered page URLs
+        - test_cases_by_page: Dict mapping page URLs to their test cases
+        - files: Dict with paths to generated Excel files
+        - summary: Dict with counts and statistics
+    """
+    import asyncio
+    from playwright.async_api import async_playwright
+    from urllib.parse import urljoin, urlparse
+    from collections import defaultdict
+
+    # Streamlit runs the script in a worker thread that has no event loop of its
+    # own; some crewai/litellm internals call asyncio.get_event_loop() and blow up
+    # with "There is no current event loop in thread" if one was never set here.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    warnings = []
+
+    def notify(message):
+        if progress_callback:
+            progress_callback(message)
+
+    # Step 1: Discover pages using Playwright
+    notify("🔍 Discovering frontend pages...")
+
+    async def discover_pages():
+        pages = set()
+        visited = set()
+        queue = [base_url]
+        base_domain = urlparse(base_url).netloc
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            while queue and len(pages) < max_pages:
+                url = queue.pop(0)
+                if url in visited:
+                    continue
+
+                visited.add(url)
+
+                try:
+                    page = await context.new_page()
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:
+                        pass  # SPA may keep network busy (polling/websockets) — don't fail the whole page for this
+
+                    # Extract all links from the page
+                    links = await page.locator("a[href]").all()
+                    for link in links[:30]:  # Limit links per page
+                        try:
+                            href = await link.get_attribute("href")
+                            if href:
+                                # Resolve relative URLs
+                                full_url = urljoin(url, href)
+                                # Only follow links within the same domain
+                                if urlparse(full_url).netloc == base_domain:
+                                    # Keep hash fragments for SPAs
+                                    if full_url not in visited and len(pages) < max_pages:
+                                        pages.add(full_url)
+                                        queue.append(full_url)
+                        except:
+                            pass
+
+                    pages.add(url)
+                    await page.close()
+
+                except Exception as e:
+                    notify(f"⚠️ Error visiting {url}: {str(e)}")
+
+            await browser.close()
+
+        return sorted(list(pages))[:max_pages]
+
+    # Run async discovery
+    discovered_pages = asyncio.run(discover_pages())
+    notify(f"✅ Discovered {len(discovered_pages)} pages")
+
+    # Step 2: Generate page descriptions for AI analysis
+    notify("📝 Analyzing each page...")
+
+    async def extract_page_content():
+        page_descriptions = {}
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            for i, page_url in enumerate(discovered_pages, 1):
+                try:
+                    page = await context.new_page()
+                    await page.goto(page_url, wait_until="domcontentloaded", timeout=10000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=3000)
+                    except Exception:
+                        pass  # SPA may keep network busy — proceed with whatever rendered so far
+
+                    # Hash-routed SPAs finish client-side routing after load; without this the
+                    # default route's DOM gets captured instead of the requested route's.
+                    await page.wait_for_timeout(1500)
+
+                    title = await page.title()
+
+                    # inner_text() returns rendered visible text only; text_content()
+                    # would also pull in <script>/<style> source, which poisons the prompt.
+                    body_text = ""
+                    try:
+                        body_text = await page.locator("body").inner_text(timeout=5000)
+                        body_text = " ".join(body_text.split())[:1200]
+                    except Exception:
+                        pass
+
+                    ui = await page.evaluate("""() => {
+                        const vis = el => {
+                            const r = el.getBoundingClientRect();
+                            const s = window.getComputedStyle(el);
+                            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                        };
+                        const txt = el => (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+
+                        const fields = [...document.querySelectorAll('input, textarea, select')]
+                            .filter(vis).slice(0, 40).map(el => ({
+                                tag: el.tagName.toLowerCase(),
+                                type: el.type || null,
+                                name: el.name || el.id || null,
+                                formControlName: el.getAttribute('formcontrolname') || null,
+                                label: (document.querySelector(`label[for="${el.id}"]`) || {}).innerText?.trim().slice(0, 60)
+                                    || el.closest('label')?.innerText?.trim().slice(0, 60) || null,
+                                value: (el.type === 'radio' || el.type === 'checkbox') ? el.value : null,
+                                placeholder: el.placeholder || null,
+                                required: el.required || el.getAttribute('aria-required') === 'true',
+                                maxlength: el.maxLength > 0 ? el.maxLength : null,
+                                pattern: el.pattern || null,
+                                min: el.min || null,
+                                max: el.max || null,
+                                options: el.tagName.toLowerCase() === 'select'
+                                    ? [...el.options].slice(0, 10).map(o => o.text.trim()) : null,
+                                ariaLabel: el.getAttribute('aria-label') || null,
+                            }));
+
+                        const buttons = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button]')]
+                            .filter(vis).slice(0, 25).map(el => ({
+                                text: txt(el) || el.value || el.getAttribute('aria-label') || null,
+                                disabled: !!el.disabled,
+                                type: el.type || null,
+                                opensMenu: el.getAttribute('aria-haspopup') || null,
+                            })).filter(b => b.text);
+
+                        const links = [...document.querySelectorAll('a[href]')]
+                            .filter(vis).slice(0, 30).map(el => ({
+                                text: txt(el) || null,
+                                href: el.getAttribute('href'),
+                                opensNewTab: el.getAttribute('target') === '_blank' || null,
+                            })).filter(l => l.text);
+
+                        const headings = [...document.querySelectorAll('h1, h2, h3')]
+                            .filter(vis).slice(0, 15).map(el => `${el.tagName}: ${txt(el)}`);
+
+                        return {
+                            headings,
+                            fields,
+                            buttons,
+                            links,
+                            formCount: document.querySelectorAll('form').length,
+                            tableCount: document.querySelectorAll('table').length,
+                            imagesMissingAlt: [...document.querySelectorAll('img')].filter(i => !i.alt).length,
+                            imageCount: document.querySelectorAll('img').length,
+                            hasFileUpload: !!document.querySelector('input[type=file]'),
+                            hasPasswordField: !!document.querySelector('input[type=password]'),
+                            hasPagination: /next|previous|page \\d/i.test(document.body.innerText || ''),
+                        };
+                    }""")
+
+                    path = urlparse(page_url).path or "/"
+                    page_name = path.strip("/").replace("/", " > ") or "Home"
+
+                    lines = [f"URL: {page_url}", f"Page name: {page_name}", f"Title: {title}"]
+                    if ui.get("headings"):
+                        lines.append("Headings: " + "; ".join(ui["headings"]))
+                    if ui.get("fields"):
+                        lines.append(f"Input fields ({len(ui['fields'])}):")
+                        for f in ui["fields"]:
+                            attrs = [f"{k}={v}" for k, v in f.items() if v not in (None, False, [], "")]
+                            lines.append("  - " + ", ".join(attrs))
+                    if ui.get("buttons"):
+                        lines.append("Buttons (no href - clicking these does NOT navigate anywhere on its own): " + "; ".join(
+                            b["text"]
+                            + (" (disabled)" if b["disabled"] else "")
+                            + (" (opens a menu/submenu, does not navigate)" if b.get("opensMenu") else "")
+                            for b in ui["buttons"]))
+                    if ui.get("links"):
+                        lines.append("Links (real navigable href): " + "; ".join(
+                            f'{l["text"]} -> {l["href"]}' + (" (opens in a NEW TAB)" if l.get("opensNewTab") else "")
+                            for l in ui["links"][:20]))
+                    structural = []
+                    if ui.get("formCount"):
+                        structural.append(f'{ui["formCount"]} form(s)')
+                    if ui.get("tableCount"):
+                        structural.append(f'{ui["tableCount"]} table(s)')
+                    if ui.get("imageCount"):
+                        structural.append(f'{ui["imageCount"]} image(s), {ui["imagesMissingAlt"]} missing alt text')
+                    if ui.get("hasFileUpload"):
+                        structural.append("has file upload")
+                    if ui.get("hasPasswordField"):
+                        structural.append("has password field")
+                    if ui.get("hasPagination"):
+                        structural.append("appears to have pagination")
+                    if structural:
+                        lines.append("Structure: " + ", ".join(structural))
+                    if body_text:
+                        lines.append(f"Visible text: {body_text}")
+
+                    page_descriptions[page_url] = "\n".join(lines)
+                    notify(f"  [{i}/{len(discovered_pages)}] Analyzed: {page_name}")
+                    await page.close()
+
+                except Exception as e:
+                    notify(f"⚠️ Error analyzing {page_url}: {str(e)}")
+                    # Fallback: use basic description
+                    path = urlparse(page_url).path or "/"
+                    page_name = path.strip("/").replace("/", " > ") or "Home"
+                    page_descriptions[page_url] = f"Page: {page_name} (URL: {page_url})"
+
+            await browser.close()
+        return page_descriptions
+
+    page_descriptions = asyncio.run(extract_page_content())
+
+    # Step 3: Generate test cases for each page using the QA engineer agent
+    notify("🧪 Generating test cases...")
+
+    test_cases_by_page = defaultdict(list)
+    all_test_cases = []
+
+    for i, (page_url, description) in enumerate(page_descriptions.items(), 1):
+        try:
+            task = Task(
+                description=f"""
+You are testing a real web page. Below is its actual inspected DOM structure — every input
+field, button and link listed was really found on the page. Write exhaustive test cases
+grounded in these SPECIFIC elements (use their real names/labels/button text), not generic ones.
+
+=== PAGE UNDER TEST ===
+{description}
+=== END PAGE ===
+
+COVERAGE RULES — work through each of these and write every case that applies:
+
+A. PER INPUT FIELD listed above, write a separate case for each that applies:
+   - valid input accepted
+   - empty/blank when the field is required
+   - wrong format (e.g. email without "@", non-numeric in a number field)
+   - boundary length (at maxlength, one over maxlength, single character)
+   - whitespace-only input, leading/trailing spaces
+   - special characters and unicode
+   - injection-style payloads (XSS `<script>`, SQL `' OR 1=1--`) are REJECTED/escaped
+   - for password fields: minimum length, weak password, password vs confirm-password mismatch, masking is applied
+   - for selects: each meaningful option, plus no-selection
+   - for file uploads: allowed type, disallowed type, oversized file
+
+B. PER BUTTON listed above:
+   - the happy path it triggers
+   - clicking it with the form empty/invalid
+   - double-click / rapid repeat submission does not duplicate the action
+   - disabled-state behaviour where relevant
+
+C. PER LINK / NAVIGATION listed above:
+   - it navigates to the correct destination
+   - browser back button returns correctly
+   - direct deep-link / page refresh preserves expected state
+
+D. ALWAYS include, for the page as a whole:
+   - page loads with all listed elements visible
+   - Accessibility: keyboard-only tab order, focus visibility, screen-reader labels on the
+     listed fields, images missing alt text (if any were reported above)
+   - Usability/Responsive: mobile viewport, tablet, desktop
+   - Security: accessing this page unauthenticated vs authenticated (if it looks protected)
+   - Performance: load time under a slow 3G network profile
+   - Negative/Error handling: backend returns 500, request times out, offline/no network
+   - Compatibility: Chrome, Firefox, Safari/WebKit
+
+RULES:
+- Output ONLY a valid JSON array. No markdown fences, no prose before or after.
+- Be thorough: a page with several input fields should produce 20-40 test cases.
+  Do NOT stop early and do NOT summarise multiple checks into one case.
+- Each case must be ONE atomic check with its own id. Never merge a positive check and a
+  negative check into the same case.
+- Reference real element names/labels from the page data above in scenario and steps.
+- Fields per object: id, page_url, scenario, type, steps, expected_result, priority
+  - type: one of "Positive", "Negative", "Edge", "FormValidation", "Security",
+    "Usability", "Accessibility", "Navigation", "Performance", "Compatibility"
+  - steps: JSON array of short discrete action strings, do not number them
+  - priority: "High", "Medium" or "Low"
+
+Example of the required shape (yours must be far more extensive and page-specific):
+[
+  {{"id":"TC_1","page_url":"{page_url}","scenario":"Submit registration with all valid details","type":"Positive","steps":["Open the page","Fill every required field with valid data","Click the submit button"],"expected_result":"Account is created and user is redirected","priority":"High"}},
+  {{"id":"TC_2","page_url":"{page_url}","scenario":"Email field rejects address with no @ symbol","type":"FormValidation","steps":["Open the page","Enter 'userexample.com' in the email field","Submit the form"],"expected_result":"Inline validation error indicates an invalid email format and the form is not submitted","priority":"High"}}
+]
+
+Now produce the full, exhaustive JSON array for: {page_url}
+""",
+                expected_output="A large JSON array of atomic, page-specific test cases",
+                agent=qa_engineer,
+                guardrail=_json_array_guardrail,
+            )
+
+            crew = Crew(agents=[qa_engineer], tasks=[task], verbose=False, memory=False)
+            crew.kickoff()
+
+            page_test_cases = extract_json(task.output) or []
+            if isinstance(page_test_cases, dict):
+                page_test_cases = [page_test_cases]
+
+            # Validate test cases
+            valid_test_cases = []
+            for tc in page_test_cases:
+                if isinstance(tc, dict) and all(k in tc for k in ["id", "scenario", "type", "steps", "expected_result"]):
+                    tc["page_url"] = page_url
+                    valid_test_cases.append(tc)
+                    all_test_cases.append(tc)
+                    test_cases_by_page[page_url].append(tc)
+
+            if not valid_test_cases:
+                warnings.append(f"No valid test cases parsed for {page_url}. Raw LLM output: {safe(task.output)[:300]}")
+            notify(f"  [{i}/{len(discovered_pages)}] Generated {len(valid_test_cases)} test cases for: {page_url}")
+
+        except Exception as e:
+            warnings.append(f"Error generating test cases for {page_url}: {e}")
+            notify(f"⚠️ Error generating test cases for {page_url}: {str(e)}")
+
+    # Step 4: Save results to Excel
+    notify("💾 Saving results...")
+
+    # Pages summary
+    pages_wb = Workbook()
+    pages_ws = pages_wb.active
+    pages_ws.title = "Discovered Pages"
+    pages_ws.append(["Page URL", "Test Cases Generated"])
+
+    for page_url in discovered_pages:
+        count = len(test_cases_by_page.get(page_url, []))
+        pages_ws.append([page_url, count])
+
+    style_sheet(pages_ws, [60, 20])
+    pages_file = os.path.join(output_dir, f"frontend_pages_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    pages_wb.save(pages_file)
+
+    # Test cases by page
+    testcases_wb = Workbook()
+    testcases_ws = testcases_wb.active
+    testcases_ws.title = "Test Cases"
+    testcases_ws.append(["Page URL", "Test ID", "Scenario", "Type", "Steps", "Expected Result", "Priority"])
+
+    for tc in all_test_cases:
+        testcases_ws.append([
+            tc.get("page_url", ""),
+            tc.get("id", ""),
+            tc.get("scenario", ""),
+            tc.get("type", ""),
+            format_steps(tc.get("steps", [])),
+            tc.get("expected_result", ""),
+            tc.get("priority", ""),
+        ])
+
+    style_sheet(testcases_ws, [40, 12, 30, 15, 40, 40, 12], wrap_cols={2, 3, 4, 5, 6})
+    testcases_file = os.path.join(output_dir, f"frontend_testcases_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    testcases_wb.save(testcases_file)
+
+    notify("✅ Frontend testing complete!")
+
+    return {
+        "discovered_pages": discovered_pages,
+        "test_cases_by_page": dict(test_cases_by_page),
+        "page_details": page_descriptions,
+        "base_url": base_url,
+        "output_dir": output_dir,
+        "files": {
+            "pages": pages_file,
+            "test_cases": testcases_file,
+        },
+        "summary": {
+            "total_pages_discovered": len(discovered_pages),
+            "total_test_cases_generated": len(all_test_cases),
+            "test_cases_per_page": {url: len(test_cases_by_page[url]) for url in discovered_pages},
+        },
+        "warnings": warnings,
+    }
+
+
+def _extract_code(text, page_url=None):
+    """Pull python source out of an LLM reply, stripping markdown fences if present."""
+    text = safe(text).strip()
+    blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
+    if blocks:
+        code = max(blocks, key=len).strip()
+    else:
+        code = text
+    code = _force_sync_playwright(code)
+    code = _fix_playwright_re_import(code)
+    if page_url:
+        code = _force_correct_goto_url(code, page_url)
+    return code
+
+
+def _force_correct_goto_url(code, page_url):
+    """
+    The `base_url` fixture holds the single seed URL the whole suite was discovered from;
+    each per-page test file is written for a DIFFERENT specific page and must navigate to
+    its own page_url, not the shared fixture. The model occasionally confuses the two
+    (probably because "base_url" reads as if it means "this page's URL") and writes
+    `page.goto(base_url)`, silently making every test in that file load the wrong page.
+    """
+    return re.sub(r"page\.goto\(\s*base_url\s*\)", f'page.goto("{page_url}")', code)
+
+
+_SINGULAR_LOCATOR_METHODS = {
+    "get_by_role", "get_by_label", "get_by_placeholder",
+    "get_by_text", "get_by_alt_text", "get_by_title",
+}
+
+
+def _disambiguate_locators_live(code, browser, page_url):
+    """
+    Mechanically catches the bug class that kept slipping through review: a locator that
+    looks unique in isolation (e.g. get_by_label("Male")) but actually matches more than
+    one element on the real page (e.g. "Female" contains "male" as a substring). Loads the
+    real page once and asks Playwright itself how many elements each locator resolves to,
+    then deterministically disambiguates with exact=True or, failing that, .first.
+
+    Skips any locator that's deliberately meant to match multiple elements (assigned to a
+    variable later used as a `for` loop's iterable, or used directly as one, or a bare
+    get_by_role(role) with no name= — e.g. `for x in page.get_by_role("spinbutton"):`)
+    since forcing those to a single match would silently break the test's intent.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, 0
+
+    protected = set()
+    candidates = {}
+
+    for func_node in ast.walk(tree):
+        if not isinstance(func_node, ast.FunctionDef):
+            continue
+
+        assigned_call_by_var = {}
+        for node in ast.walk(func_node):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                src = ast.get_source_segment(code, node.value)
+                if src:
+                    for t in node.targets:
+                        if isinstance(t, ast.Name):
+                            assigned_call_by_var[t.id] = src
+
+        for node in ast.walk(func_node):
+            if isinstance(node, ast.For):
+                it = node.iter
+                src = assigned_call_by_var.get(it.id) if isinstance(it, ast.Name) else ast.get_source_segment(code, it)
+                if src:
+                    protected.add(src)
+
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name) and fn.value.id == "page"):
+                continue
+            if fn.attr not in _SINGULAR_LOCATOR_METHODS:
+                continue
+            try:
+                args = [ast.literal_eval(a) for a in node.args]
+                kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in node.keywords if kw.arg}
+            except (ValueError, TypeError):
+                continue  # non-literal argument (e.g. a variable) - can't safely re-evaluate live
+            if fn.attr == "get_by_role" and "name" not in kwargs:
+                continue  # role-only lookups are usually intentionally plural
+            src = ast.get_source_segment(code, node)
+            if src and src not in candidates:
+                candidates[src] = (fn.attr, args, kwargs)
+
+    candidates = {src: v for src, v in candidates.items() if src not in protected}
+    if not candidates:
+        return code, 0
+
+    try:
+        page = browser.new_page()
+        page.goto(page_url, wait_until="domcontentloaded", timeout=10000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+    except Exception:
+        return code, 0
+
+    fixed = 0
+    try:
+        for call_text, (method, args, kwargs) in candidates.items():
+            try:
+                count = getattr(page, method)(*args, **kwargs).count()
+            except Exception:
+                continue
+            if count <= 1:
+                continue
+
+            replacement = None
+            if not kwargs.get("exact"):
+                try:
+                    exact_kwargs = {**kwargs, "exact": True}
+                    if getattr(page, method)(*args, **exact_kwargs).count() == 1:
+                        replacement = call_text[:-1] + ", exact=True)"
+                except Exception:
+                    pass
+            if replacement is None and not call_text.endswith(".first"):
+                replacement = call_text + ".first"
+
+            if replacement:
+                code = code.replace(call_text, replacement)
+                fixed += 1
+    finally:
+        page.close()
+
+    return code, fixed
+
+
+def _fix_playwright_re_import(code):
+    """
+    The model sometimes hallucinates `re` as a playwright.sync_api export (it isn't -
+    `re` is the stdlib module used for regex matchers like re.compile). Strip it from
+    the playwright import line and add a real `import re` if one isn't already present.
+    """
+    match = re.search(r"^from playwright\.sync_api import (.+)$", code, re.MULTILINE)
+    if not match:
+        return code
+    names = [n.strip() for n in match.group(1).split(",")]
+    if "re" not in names:
+        return code
+    names.remove("re")
+    new_line = "from playwright.sync_api import " + ", ".join(names)
+    code = code[: match.start()] + new_line + code[match.end() :]
+    if not re.search(r"^import re\s*$", code, re.MULTILINE):
+        code = "import re\n" + code
+    return code
+
+
+def _force_sync_playwright(code):
+    """
+    Despite explicit sync-API instructions, the model sometimes writes async def/await
+    (its more common Playwright training pattern). Playwright's sync and async APIs are
+    method-for-method identical, so a straight token rewrite is a safe, deterministic fix
+    rather than re-prompting and hoping for compliance.
+    """
+    if "async def" not in code and re.search(r"\bawait\b", code) is None:
+        return code
+    code = re.sub(r"\basync def\b", "def", code)
+    code = re.sub(r"\bawait\s+", "", code)
+    code = re.sub(r"\basync with\b", "with", code)
+    code = code.replace("playwright.async_api", "playwright.sync_api")
+    # leftover from async-style generation; meaningless (and unregistered) on sync tests
+    code = re.sub(r"^[ \t]*@pytest\.mark\.asyncio\s*\n", "", code, flags=re.MULTILINE)
+    code = code.replace("import pytest_asyncio\n", "")
+    return code
+
+
+def _slugify(url):
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    raw = (parsed.path or "") + (parsed.fragment or "")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower()
+    return slug or "home"
+
+
+CONFTEST_TEMPLATE = '''import os
+import pytest
+from playwright.sync_api import sync_playwright
+
+BASE_URL = os.getenv("BASE_URL", "{base_url}")
+HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
+TIMEOUT = int(os.getenv("TIMEOUT", "30000"))
+
+
+@pytest.fixture(scope="session")
+def base_url():
+    return BASE_URL
+
+
+@pytest.fixture(scope="session")
+def browser():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        yield browser
+        browser.close()
+
+
+@pytest.fixture
+def page(browser):
+    context = browser.new_context(viewport={{"width": 1920, "height": 1080}})
+    page = context.new_page()
+    page.set_default_timeout(TIMEOUT)
+    yield page
+    context.close()
+'''
+
+PYTEST_INI = """[pytest]
+addopts = -v --tb=short
+testpaths = .
+"""
+
+SUITE_README = """# Generated Playwright Suite
+
+Auto-generated from the QA Agent frontend analysis of `{base_url}`.
+
+## One-time setup
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+## Run the tests
+
+```bash
+# all tests (headless)
+pytest
+
+# watch the browser while it runs
+HEADLESS=false pytest          # Windows PowerShell: $env:HEADLESS="false"; pytest
+
+# a single file
+pytest {example_file}
+
+# point the suite at a different environment
+BASE_URL=https://staging.example.com pytest
+
+# with an HTML report
+pytest --html=report.html --self-contained-html
+```
+
+## Notes
+
+These scripts are a starting point generated from the test cases. Selectors were taken from
+the live DOM at generation time, but assertions for flows needing real credentials or
+server state are marked with `pytest.skip` or `TODO` and need your input before they pass.
+"""
+
+SUITE_REQUIREMENTS = """pytest>=8.0.0
+playwright>=1.40.0
+pytest-playwright>=0.4.0
+pytest-html>=4.1.0
+"""
+
+
+def generate_playwright_scripts(test_cases_by_page, base_url, page_details=None, output_dir=".", progress_callback=None):
+    """
+    Turn generated frontend test cases into a runnable local Playwright + pytest suite.
+
+    Writes one test_*.py per page plus conftest.py, pytest.ini, requirements.txt and a
+    README into <output_dir>/playwright_suite, and returns a dict describing what was
+    written (suite_dir, files, counts, warnings).
+    """
+    suite_dir = os.path.join(output_dir, "playwright_suite")
+    os.makedirs(suite_dir, exist_ok=True)
+
+    page_details = page_details or {}
+    warnings = []
+    written_files = []
+
+    def notify(message):
+        if progress_callback:
+            progress_callback(message)
+
+    pages_with_cases = {url: tcs for url, tcs in test_cases_by_page.items() if tcs}
+    if not pages_with_cases:
+        raise ValueError("No test cases available to convert into Playwright scripts.")
+
+    from playwright.sync_api import sync_playwright
+    _pw_ctx = sync_playwright().start()
+    _verification_browser = _pw_ctx.chromium.launch(headless=True)
+
+    for i, (page_url, test_cases) in enumerate(pages_with_cases.items(), 1):
+        slug = _slugify(page_url)
+        filename = f"test_{slug}.py"
+
+        case_lines = []
+        for tc in test_cases:
+            steps = tc.get("steps")
+            steps_text = " -> ".join(steps) if isinstance(steps, list) else safe(steps)
+            case_lines.append(
+                f'- id={tc.get("id")} | type={tc.get("type")} | priority={tc.get("priority")}\n'
+                f'  scenario: {tc.get("scenario")}\n'
+                f'  steps: {steps_text}\n'
+                f'  expected: {tc.get("expected_result")}'
+            )
+        cases_block = "\n".join(case_lines)
+
+        task = Task(
+            description=f"""
+Write a single Python Playwright test file implementing the manual test cases below.
+
+TARGET PAGE: {page_url}
+
+ACTUAL PAGE STRUCTURE (selectors seen in the live DOM — use these, do not invent selectors):
+{page_details.get(page_url, "(not available)")}
+
+TEST CASES TO IMPLEMENT:
+{cases_block}
+
+REQUIREMENTS:
+- Output ONLY Python source code. No markdown fences, no commentary.
+- Use the Playwright SYNC API via pytest, with this exact fixture contract already provided
+  by an existing conftest.py (do NOT redefine these, do NOT call sync_playwright yourself):
+    * `page`      - a ready Playwright Page
+    * `base_url`  - the application base URL string
+- Import only: `import pytest`, `import re` (if needed), and
+  `from playwright.sync_api import expect, Page`
+- One test function per test case, named test_<lowercase_snake_case_of_scenario>, and put
+  the test case id in the docstring.
+- Navigate with `page.goto("{page_url}")`.
+- Prefer resilient locators in this order: get_by_role, get_by_label, get_by_placeholder,
+  then CSS with the real name/id attributes shown in the page structure above.
+- If a field's `label` shown above is null/missing (common for `<select>` and grouped
+  radio/checkbox inputs) but it has a `formControlName`, use
+  `page.locator('[formcontrolname="..."]')` instead of guessing a label — a missing label
+  usually means the visible on-page text is not actually wired to that element via `for`,
+  so `get_by_label` would either match nothing (hang/timeout) or match the wrong element.
+- NEVER use a bare `page.locator("text=...")` or `get_by_text(...)` with a short/generic
+  string — Playwright runs in strict mode and raises "resolved to N elements" if more than
+  one element contains that text (this is common: a link, a heading and a paragraph can
+  all contain the same word). Use `get_by_role("link"/"button", name="...", exact=True)`
+  with the exact visible text from the Buttons/Links list above, and if a locator could
+  still match more than one element, add `.first` explicitly.
+- The same strict-mode ambiguity applies to `get_by_label(...)` and `get_by_placeholder(...)`:
+  by default they match on substring, not full text, so pairs like "Password"/"Confirm
+  Password" or "Male"/"Female" (which contains "male") will both match the shorter string.
+  Whenever two labels/placeholders on the page share a common substring, pass `exact=True`
+  to every `get_by_label`/`get_by_placeholder` call involved, not just the ambiguous one.
+- For `<select>` elements, always call `.select_option(label="...")` using the visible
+  option text. Never pass a bare positional string — that matches against the option's
+  `value` attribute, which frequently differs from its visible label (e.g. the value may be
+  encoded as "1: Doctor" while the visible text is just "Doctor"), causing a silent
+  no-match/timeout instead of a clear error.
+- To verify a password field is masked, assert `to_have_attribute("type", "password")`.
+  Never assert that the field's value differs from what you just filled — masking is a
+  purely visual effect and never changes the underlying value, so that assertion can never
+  pass.
+
+- ASSERTIONS: use ONLY the methods listed here. Do NOT invent any other assertion method.
+    expect(locator).to_be_visible() | to_be_hidden() | to_be_enabled() | to_be_disabled()
+    expect(locator).to_be_editable() | to_be_empty() | to_be_checked() | to_be_focused()
+    expect(locator).to_have_text(t) | to_contain_text(t) | to_have_value(v)
+    expect(locator).to_have_count(n) | to_have_class(c)
+    expect(locator).to_have_attribute(name, value)   <- BOTH arguments are required
+    expect(page).to_have_url(u) | to_have_title(t)
+  Any of the above can be negated with the `not_` form, e.g. expect(loc).not_to_be_visible().
+  There is no assertion for scrolling, layout, colour, or "looks correct" — for those,
+  assert element visibility at the relevant viewport size instead.
+
+- NEVER assert on markup you were not shown in the page structure above. Specifically:
+    * do NOT assert CSS classes such as 'is-invalid'/'error' unless they appear above
+    * do NOT assert a redirect/success URL unless that URL appears above
+- Only elements from the Links list (a real `href` you were shown) may be asserted to
+  navigate to a URL. A plain `<button>` (from the Buttons list) has no href — clicking it
+  may open a menu, submit a form, or run arbitrary JS, but you have NO evidence it changes
+  the URL, so do NOT write `expect(page).to_have_url(...)` after clicking one. If a button
+  is marked "(opens a menu/submenu, does not navigate)", assert that instead, e.g.
+  `expect(button).to_have_attribute("aria-expanded", "true")` after clicking it. If a link
+  is marked "(opens in a NEW TAB)", the current `page` will never navigate — use
+  `with page.context.expect_page() as new_tab_info:` around the click, then assert on
+  `new_tab_info.value.url`, not `page.url`.
+
+- Single-page apps rewrite their own URL on load (e.g. "/client/" becomes
+  "/client/#/auth/login"), so NEVER assert that the URL still equals the URL you navigated
+  to. To prove a form was rejected / not submitted, assert that a form element is still
+  visible, e.g. expect(page.get_by_placeholder("...")).to_be_visible().
+  If you must assert a URL, match a fragment of the route with a regex:
+  expect(page).to_have_url(re.compile(r"auth/login")).
+
+- MANDATORY SKIPS — begin the function body with `pytest.skip("needs <specific thing>")`
+  for any case whose expected outcome depends on something you cannot obtain here:
+  a successful login, valid credentials, a registered/seeded account, a specific redirect
+  target, email delivery, or a server-forced 500/timeout. Write the function, then skip it.
+  Guessing a URL or an error string instead of skipping is a failure.
+
+- For responsive/viewport cases use `page.set_viewport_size({{"width": w, "height": h}})`.
+- For cross-browser cases, do not launch other browsers — the `page` fixture is Chromium;
+  `pytest.skip("needs firefox/webkit runner")` instead.
+- For keyboard/tab-order cases: the exact tab order is not knowable from the page data
+  above, so do NOT assert that a specific field receives focus after a fixed number of
+  Tab presses. Instead assert the general capability, e.g. press Tab repeatedly and
+  assert `page.locator(":focus")` has count 1 (something became focused), or that a named
+  element `to_be_focused()` only after you explicitly `.focus()` it yourself first.
+- Group related tests in classes only if it improves readability.
+- The file must be syntactically valid and import-safe.
+
+Return the complete contents of {filename}.
+""",
+            expected_output="Complete, runnable Python Playwright pytest module source",
+            agent=automation_engineer,
+        )
+
+        try:
+            crew = Crew(agents=[automation_engineer], tasks=[task], verbose=False, memory=False)
+            crew.kickoff()
+            code = _extract_code(task.output, page_url)
+
+            if not code:
+                warnings.append(f"{filename}: model returned no code")
+                continue
+
+            try:
+                compile(code, filename, "exec")
+            except SyntaxError as e:
+                warnings.append(f"{filename}: generated code had a syntax error ({e.msg} on line {e.lineno}); saved anyway for manual fixing")
+
+            code, disambiguated = _disambiguate_locators_live(code, _verification_browser, page_url)
+            if disambiguated:
+                notify(f"  [{i}/{len(pages_with_cases)}] Auto-disambiguated {disambiguated} locator(s) in {filename} against the live page")
+
+            risky = re.findall(r'(?:locator|get_by_text)\(\s*["\'](?:text=)?([^"\']{1,40})["\']\s*\)(?!\.first)', code)
+            if risky:
+                warnings.append(
+                    f"{filename}: {len(risky)} locator(s) may match multiple elements and lack "
+                    f"exact=True/.first (e.g. {risky[0]!r}) — review before trusting a pass/fail result"
+                )
+
+            path = os.path.join(suite_dir, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(code.rstrip() + "\n")
+
+            written_files.append(path)
+            notify(f"  [{i}/{len(pages_with_cases)}] Wrote {filename} ({len(test_cases)} cases)")
+
+        except Exception as e:
+            warnings.append(f"{filename}: {e}")
+            notify(f"⚠️ Failed to generate {filename}: {e}")
+
+    _verification_browser.close()
+    _pw_ctx.stop()
+
+    if not written_files:
+        raise RuntimeError("No Playwright scripts could be generated. " + " | ".join(warnings))
+
+    # Scaffolding written deterministically rather than by the LLM.
+    with open(os.path.join(suite_dir, "conftest.py"), "w", encoding="utf-8") as f:
+        f.write(CONFTEST_TEMPLATE.format(base_url=base_url))
+    with open(os.path.join(suite_dir, "pytest.ini"), "w", encoding="utf-8") as f:
+        f.write(PYTEST_INI)
+    with open(os.path.join(suite_dir, "requirements.txt"), "w", encoding="utf-8") as f:
+        f.write(SUITE_REQUIREMENTS)
+    with open(os.path.join(suite_dir, "README.md"), "w", encoding="utf-8") as f:
+        f.write(SUITE_README.format(
+            base_url=base_url,
+            example_file=os.path.basename(written_files[0]),
+        ))
+
+    notify(f"✅ Playwright suite written to {suite_dir}")
+
+    return {
+        "suite_dir": os.path.abspath(suite_dir),
+        "test_files": written_files,
+        "total_files": len(written_files),
+        "total_cases": sum(len(t) for t in pages_with_cases.values()),
+        "warnings": warnings,
+    }
 
 
 def generate_test_strategy(requirement_items, final_test_cases, automation_summary, estimation, output_dir="."):

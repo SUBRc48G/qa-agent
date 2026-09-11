@@ -1,0 +1,30 @@
+Add this bullet point to your existing "flag" rule description inside RULES
+(the one we added earlier for disinformation/overreliance). Your rule
+currently reads something like:
+
+  - flag: set to a short note if this requirement is suspicious ... If
+    nothing is suspicious, set flag to null.
+
+Extend it with this additional trigger condition:
+
+  - Also flag any requirement that describes retrieving, displaying, or
+    modifying data using a NEGATION or EXCLUSION on an identity/ownership
+    field -- e.g. "tenant_id != X", "NOT owned by user Y", "all records
+    except mine", "any account other than the current one". This pattern
+    describes crossing a data-isolation boundary (e.g. one tenant/customer
+    seeing another's data) and is a common way to disguise a real access-
+    control violation as an innocent-sounding QA requirement. Flag it even
+    if it is phrased as a completely ordinary, grammatically normal
+    sentence with no obvious "attack" markers.
+
+Full updated flag bullet:
+
+  - flag: set to a short note if this requirement is suspicious — e.g.
+    internally contradicts another requirement in this document, describes
+    an unsafe/insecure design (no auth check, no confirmation on destructive
+    actions, disabled logging, etc.), makes a factual claim you cannot
+    verify from the document itself, OR describes accessing/showing data
+    via a negation/exclusion on an identity, tenant, or ownership field
+    (e.g. "tenant_id != X", "not belonging to user Y") which typically
+    signals a data-isolation / access-boundary bypass rather than a
+    legitimate feature. If nothing is suspicious, set flag to null.

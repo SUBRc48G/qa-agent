@@ -1,12 +1,20 @@
 import os
 import html
 import time
+import shutil
 import tempfile
 from datetime import datetime
 
 import streamlit as st
 
-from agent import load_requirements, run_pipeline, generate_test_strategy, default_testcases_per_day
+from agent import (
+    load_requirements,
+    run_pipeline,
+    generate_test_strategy,
+    generate_frontend_testcases,
+    generate_playwright_scripts,
+    default_testcases_per_day,
+)
 
 st.set_page_config(page_title="QA Test Case Generator", page_icon="🧪", layout="wide")
 
@@ -214,6 +222,8 @@ with st.sidebar:
         run_path = os.path.join(OUTPUTS_ROOT, selected_run)
         for fname in sorted(os.listdir(run_path)):
             fpath = os.path.join(run_path, fname)
+            if not os.path.isfile(fpath):
+                continue
             with open(fpath, "rb") as f:
                 st.download_button(
                     f"{_file_icon(fname)} {fname}",
@@ -237,159 +247,354 @@ with st.sidebar:
 
 render_hero()
 
-uploaded_file = st.file_uploader(
-    "Upload requirements",
-    type=["txt", "pdf", "docx", "xlsx"],
-    help="Supported formats: Word (.docx), Excel (.xlsx), PDF (.pdf), Notepad/plain text (.txt)",
-)
+# Create tabs for different QA workflows
+tab1, tab2 = st.tabs(["📋 Requirements-Based Testing", "🌐 Frontend Page Testing"])
 
-render_steps(uploaded_file, st.session_state.get("result"), st.session_state.get("strategy_path"))
+with tab1:
+    st.markdown("### Upload a requirements document to generate test cases")
 
-testcases_per_day = st.number_input(
-    "Test cases executable per day (used for effort estimation)",
-    min_value=1,
-    value=default_testcases_per_day,
-    step=1,
-)
+    uploaded_file = st.file_uploader(
+        "Upload requirements",
+        type=["txt", "pdf", "docx", "xlsx"],
+        help="Supported formats: Word (.docx), Excel (.xlsx), PDF (.pdf), Notepad/plain text (.txt)",
+        key="req_uploader",
+    )
 
-generate = st.button("🚀 Run QA Analysis", type="primary", disabled=uploaded_file is None)
+with tab2:
+    st.markdown("### Test a live frontend application")
+    st.caption("Enter a URL and the tool will discover pages and generate comprehensive test cases for each one.")
 
-if generate and uploaded_file is not None:
-    suffix = os.path.splitext(uploaded_file.name)[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        tmp_path = tmp.name
+    frontend_url = st.text_input(
+        "Frontend URL",
+        placeholder="https://example.com or http://localhost:3000",
+        help="The base URL of the frontend application to test",
+        key="frontend_url_input",
+    )
 
-    try:
-        requirements_text = load_requirements(tmp_path)
-    finally:
-        os.remove(tmp_path)
+    max_pages = st.number_input(
+        "Maximum pages to discover",
+        min_value=1,
+        max_value=50,
+        value=10,
+        help="Maximum number of pages to discover and analyze",
+        key="max_pages_input",
+    )
 
-    if not requirements_text.strip():
-        st.error("No text could be extracted from the uploaded file.")
-    else:
-        with st.expander("Extracted requirements text", expanded=False):
-            st.text(requirements_text)
+    discover_button = st.button(
+        "🔍 Discover Pages & Generate Test Cases",
+        type="primary",
+        disabled=not frontend_url,
+        key="discover_button",
+    )
 
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = os.path.join("outputs", run_id)
+    if discover_button and frontend_url:
+        # Validate URL
+        if not frontend_url.startswith(("http://", "https://")):
+            st.error("❌ Please enter a valid URL starting with http:// or https://")
+        else:
+            frontend_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            frontend_output_dir = os.path.join("outputs", frontend_run_id)
 
-        with st.status("Running the QA crew...", expanded=True) as status_box:
-            def report_progress(message, _box=status_box):
-                _box.write(message)
+            with st.status("🚀 Analyzing frontend application...", expanded=True) as status_box:
+                def frontend_progress(message, _box=status_box):
+                    _box.write(message)
 
-            result = run_pipeline(
-                requirements_text,
-                testcases_per_day=testcases_per_day,
-                output_dir=output_dir,
-                progress_callback=report_progress,
-            )
-            if result.get("warnings"):
-                status_box.update(label="QA crew finished with warnings", state="error")
-            else:
-                status_box.update(label="QA crew finished", state="complete")
+                try:
+                    frontend_result = generate_frontend_testcases(
+                        base_url=frontend_url,
+                        max_pages=max_pages,
+                        output_dir=frontend_output_dir,
+                        progress_callback=frontend_progress,
+                    )
+                    st.session_state["frontend_result"] = frontend_result
+                    status_box.update(label="✅ Frontend analysis complete", state="complete")
+                except Exception as e:
+                    status_box.update(label="❌ Error during analysis", state="error")
+                    st.error(f"Error: {str(e)}")
+                    st.session_state["frontend_result"] = None
 
-        st.session_state["result"] = result
-        st.session_state.pop("strategy_path", None)
-        st.rerun()
+# Handle requirements-based testing
+with tab1:
+    render_steps(uploaded_file, st.session_state.get("result"), st.session_state.get("strategy_path"))
 
-result = st.session_state.get("result")
+    testcases_per_day = st.number_input(
+        "Test cases executable per day (used for effort estimation)",
+        min_value=1,
+        value=default_testcases_per_day,
+        step=1,
+    )
 
-if result:
-    if result.get("warnings"):
-        st.warning("Pipeline completed with issues:\n\n" + "\n".join(f"- {w}" for w in result["warnings"]))
-    else:
-        st.success("Pipeline completed")
+    generate = st.button("🚀 Run QA Analysis", type="primary", disabled=uploaded_file is None)
 
-    counts = result["counts"]
-    with st.container(border=True):
-        st.markdown("#### 📊 Overview")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Requirements", counts["requirements"])
-        col2.metric("Generated Test Cases", counts["generated_test_cases"])
-        col3.metric("Final Test Cases", counts["final_test_cases"])
+    if generate and uploaded_file is not None:
+        suffix = os.path.splitext(uploaded_file.name)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded_file.getbuffer())
+            tmp_path = tmp.name
 
-        automation = result.get("automation_summary")
+        try:
+            requirements_text = load_requirements(tmp_path)
+        finally:
+            os.remove(tmp_path)
+
+        if not requirements_text.strip():
+            st.error("No text could be extracted from the uploaded file.")
+        else:
+            with st.expander("Extracted requirements text", expanded=False):
+                st.text(requirements_text)
+
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.join("outputs", run_id)
+
+            with st.status("Running the QA crew...", expanded=True) as status_box:
+                def report_progress(message, _box=status_box):
+                    _box.write(message)
+
+                result = run_pipeline(
+                    requirements_text,
+                    testcases_per_day=testcases_per_day,
+                    output_dir=output_dir,
+                    progress_callback=report_progress,
+                )
+                if result.get("warnings"):
+                    status_box.update(label="QA crew finished with warnings", state="error")
+                else:
+                    status_box.update(label="QA crew finished", state="complete")
+
+            st.session_state["result"] = result
+            st.session_state.pop("strategy_path", None)
+            st.rerun()
+
+    result = st.session_state.get("result")
+
+    if result:
+        if result.get("warnings"):
+            st.warning("Pipeline completed with issues:\n\n" + "\n".join(f"- {w}" for w in result["warnings"]))
+        else:
+            st.success("Pipeline completed")
+
+        counts = result["counts"]
+        with st.container(border=True):
+            st.markdown("#### 📊 Overview")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Requirements", counts["requirements"])
+            col2.metric("Generated Test Cases", counts["generated_test_cases"])
+            col3.metric("Final Test Cases", counts["final_test_cases"])
+
+            automation = result.get("automation_summary")
+            if automation:
+                col4.metric(
+                    "Automatable",
+                    f'{automation["automatable"]}/{automation["total"]} ({automation["coverage_pct"]}%)',
+                )
+
         if automation:
-            col4.metric(
-                "Automatable",
-                f'{automation["automatable"]}/{automation["total"]} ({automation["coverage_pct"]}%)',
+            with st.container(border=True):
+                st.markdown("#### 🤖 Automation Feasibility")
+                render_coverage_badge(automation["coverage_pct"])
+                st.write("")
+                if automation["tool_counts"]:
+                    render_automation_bars(automation["tool_counts"])
+                else:
+                    st.write("No automatable test cases identified.")
+
+        estimation = result.get("estimation")
+        if estimation:
+            with st.container(border=True):
+                st.markdown("#### 📅 Effort Estimation")
+                e1, e2, e3 = st.columns(3)
+                e1.metric("Total Test Cases", estimation.get("total_test_cases", counts["final_test_cases"]))
+                e2.metric("Test Cases / Day", estimation.get("test_cases_per_day", testcases_per_day))
+                e3.metric("Estimated Days", estimation.get("estimated_days", "-"))
+
+        with st.container(border=True):
+            st.markdown("#### 📥 Download Reports")
+            labels = {
+                "requirements": "📋 Requirements Analysis",
+                "test_cases": "🧾 Draft Test Cases",
+                "review": "🔍 Review Comments",
+                "final": "✅ Final Test Cases",
+                "automation": "🤖 Automation Feasibility",
+                "estimation": "📅 Effort Estimation",
+            }
+
+            cols = st.columns(3)
+            for i, (key, label) in enumerate(labels.items()):
+                path = result["files"].get(key)
+                if path and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        cols[i % 3].download_button(
+                            label=f"Download {label}",
+                            data=f.read(),
+                            file_name=os.path.basename(path),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"download_{key}",
+                            use_container_width=True,
+                        )
+
+        with st.container(border=True):
+            st.markdown("#### 📝 Test Strategy Document")
+            st.caption(
+                "Generates a Word document covering scope & objectives, test approach, automation "
+                "approach, effort estimation, roles & responsibilities, deliverables, entry/exit "
+                "criteria, risks, and metrics/reporting — built from this run's results."
             )
 
-    if automation:
-        with st.container(border=True):
-            st.markdown("#### 🤖 Automation Feasibility")
-            render_coverage_badge(automation["coverage_pct"])
-            st.write("")
-            if automation["tool_counts"]:
-                render_automation_bars(automation["tool_counts"])
-            else:
-                st.write("No automatable test cases identified.")
+            if st.button("📝 Create Test Strategy"):
+                with st.spinner("Writing the test strategy document..."):
+                    strategy_path = generate_test_strategy(
+                        requirement_items=result["data"]["requirements"],
+                        final_test_cases=result["data"]["final_test_cases"],
+                        automation_summary=result.get("automation_summary"),
+                        estimation=result.get("estimation"),
+                        output_dir=result["output_dir"],
+                    )
+                st.session_state["strategy_path"] = strategy_path
+                st.rerun()
 
-    estimation = result.get("estimation")
-    if estimation:
-        with st.container(border=True):
-            st.markdown("#### 📅 Effort Estimation")
-            e1, e2, e3 = st.columns(3)
-            e1.metric("Total Test Cases", estimation.get("total_test_cases", counts["final_test_cases"]))
-            e2.metric("Test Cases / Day", estimation.get("test_cases_per_day", testcases_per_day))
-            e3.metric("Estimated Days", estimation.get("estimated_days", "-"))
-
-    with st.container(border=True):
-        st.markdown("#### 📥 Download Reports")
-        labels = {
-            "requirements": "📋 Requirements Analysis",
-            "test_cases": "🧾 Draft Test Cases",
-            "review": "🔍 Review Comments",
-            "final": "✅ Final Test Cases",
-            "automation": "🤖 Automation Feasibility",
-            "estimation": "📅 Effort Estimation",
-        }
-
-        cols = st.columns(3)
-        for i, (key, label) in enumerate(labels.items()):
-            path = result["files"].get(key)
-            if path and os.path.exists(path):
-                with open(path, "rb") as f:
-                    cols[i % 3].download_button(
-                        label=f"Download {label}",
+            strategy_path = st.session_state.get("strategy_path")
+            if strategy_path and os.path.exists(strategy_path):
+                st.success("Test strategy document ready")
+                with open(strategy_path, "rb") as f:
+                    st.download_button(
+                        label="Download Test Strategy (.docx)",
                         data=f.read(),
-                        file_name=os.path.basename(path),
+                        file_name=os.path.basename(strategy_path),
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key="download_strategy",
+                    )
+    else:
+        st.info("Upload a requirements file and click **Run QA Analysis** to get started.")
+# Display frontend test results
+with tab2:
+    frontend_result = st.session_state.get("frontend_result")
+
+    if frontend_result:
+        st.divider()
+
+        warnings = frontend_result.get("warnings") or []
+        if warnings:
+            st.warning("Frontend testing completed with issues:\n\n" + "\n".join(f"- {w}" for w in warnings))
+        else:
+            st.success("✅ Frontend testing complete!")
+
+        summary = frontend_result.get("summary", {})
+        with st.container(border=True):
+            st.markdown("#### 📊 Frontend Analysis Summary")
+            col1, col2 = st.columns(2)
+            col1.metric("Pages Discovered", summary.get("total_pages_discovered", 0))
+            col2.metric("Test Cases Generated", summary.get("total_test_cases_generated", 0))
+
+        # Discovered pages
+        with st.container(border=True):
+            st.markdown("#### 🗺️ Discovered Pages")
+            pages = frontend_result.get("discovered_pages", [])
+            test_cases_by_page = frontend_result.get("test_cases_by_page", {})
+
+            for page_url in pages:
+                tc_count = len(test_cases_by_page.get(page_url, []))
+                st.write(f"• **{page_url}** — {tc_count} test cases")
+
+        # Download results
+        with st.container(border=True):
+            st.markdown("#### 📥 Download Test Cases")
+            files = frontend_result.get("files", {})
+
+            col1, col2 = st.columns(2)
+
+            if files.get("pages") and os.path.exists(files["pages"]):
+                with open(files["pages"], "rb") as f:
+                    col1.download_button(
+                        label="📄 Download Pages List",
+                        data=f.read(),
+                        file_name=os.path.basename(files["pages"]),
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download_{key}",
+                        key="download_frontend_pages",
                         use_container_width=True,
                     )
 
-    with st.container(border=True):
-        st.markdown("#### 📝 Test Strategy Document")
-        st.caption(
-            "Generates a Word document covering scope & objectives, test approach, automation "
-            "approach, effort estimation, roles & responsibilities, deliverables, entry/exit "
-            "criteria, risks, and metrics/reporting — built from this run's results."
-        )
+            if files.get("test_cases") and os.path.exists(files["test_cases"]):
+                with open(files["test_cases"], "rb") as f:
+                    col2.download_button(
+                        label="🧾 Download Test Cases",
+                        data=f.read(),
+                        file_name=os.path.basename(files["test_cases"]),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_frontend_testcases",
+                        use_container_width=True,
+                    )
 
-        if st.button("📝 Create Test Strategy"):
-            with st.spinner("Writing the test strategy document..."):
-                strategy_path = generate_test_strategy(
-                    requirement_items=result["data"]["requirements"],
-                    final_test_cases=result["data"]["final_test_cases"],
-                    automation_summary=result.get("automation_summary"),
-                    estimation=result.get("estimation"),
-                    output_dir=result["output_dir"],
-                )
-            st.session_state["strategy_path"] = strategy_path
-            st.rerun()
+        # Playwright automation suite
+        with st.container(border=True):
+            st.markdown("#### 🎭 Playwright Automation Suite")
+            st.caption(
+                "Converts the test cases above into runnable Playwright + pytest scripts saved "
+                "locally, so you can re-run the automation any time from your terminal."
+            )
 
-        strategy_path = st.session_state.get("strategy_path")
-        if strategy_path and os.path.exists(strategy_path):
-            st.success("Test strategy document ready")
-            with open(strategy_path, "rb") as f:
-                st.download_button(
-                    label="Download Test Strategy (.docx)",
-                    data=f.read(),
-                    file_name=os.path.basename(strategy_path),
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key="download_strategy",
+            total_cases = summary.get("total_test_cases_generated", 0)
+
+            if not total_cases:
+                st.info("Generate test cases first — there's nothing to automate yet.")
+            elif st.button("🎭 Generate Playwright Scripts", key="gen_playwright"):
+                with st.status("Writing Playwright scripts...", expanded=True) as pw_status:
+                    def pw_progress(message, _box=pw_status):
+                        _box.write(message)
+
+                    try:
+                        suite = generate_playwright_scripts(
+                            test_cases_by_page=frontend_result["test_cases_by_page"],
+                            base_url=frontend_result.get("base_url", ""),
+                            page_details=frontend_result.get("page_details"),
+                            output_dir=frontend_result.get("output_dir", "outputs"),
+                            progress_callback=pw_progress,
+                        )
+                        st.session_state["playwright_suite"] = suite
+                        pw_status.update(label="✅ Playwright suite ready", state="complete")
+                    except Exception as e:
+                        pw_status.update(label="❌ Script generation failed", state="error")
+                        st.error(f"Error: {e}")
+
+            suite = st.session_state.get("playwright_suite")
+            if suite:
+                if suite.get("warnings"):
+                    st.warning("Generated with issues:\n\n" + "\n".join(f"- {w}" for w in suite["warnings"]))
+
+                s1, s2 = st.columns(2)
+                s1.metric("Test Files", suite.get("total_files", 0))
+                s2.metric("Cases Automated", suite.get("total_cases", 0))
+
+                st.markdown("**Saved to:**")
+                st.code(suite["suite_dir"], language=None)
+
+                st.markdown("**Run it locally:**")
+                st.code(
+                    f'cd "{suite["suite_dir"]}"\n'
+                    "pip install -r requirements.txt\n"
+                    "playwright install chromium\n"
+                    "pytest",
+                    language="bash",
                 )
-else:
-    st.info("Upload a requirements file and click **Run QA Analysis** to get started.")
+                st.caption(
+                    "Add `HEADLESS=false` to watch the browser, or "
+                    "`--html=report.html --self-contained-html` for an HTML report."
+                )
+
+                with st.expander("Generated files", expanded=False):
+                    for path in suite.get("test_files", []):
+                        st.write(f"• {os.path.basename(path)}")
+
+                zip_base = os.path.join(
+                    os.path.dirname(suite["suite_dir"]), "playwright_suite"
+                )
+                zip_path = shutil.make_archive(zip_base, "zip", suite["suite_dir"])
+                with open(zip_path, "rb") as f:
+                    st.download_button(
+                        label="📦 Download Suite as ZIP",
+                        data=f.read(),
+                        file_name="playwright_suite.zip",
+                        mime="application/zip",
+                        key="download_pw_suite",
+                    )
+    else:
+        st.info("Enter a URL and click **Discover Pages & Generate Test Cases** to analyze a frontend application.")

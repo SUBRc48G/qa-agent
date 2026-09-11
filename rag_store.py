@@ -7,7 +7,7 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # ---------------- VECTOR DB ----------------
 client = chromadb.Client()
-collection = client.create_collection("qa_kb")
+collection = client.get_or_create_collection("qa_kb")
 
 # ---------------- LOAD DATA ----------------
 for i, item in enumerate(qa_examples):
